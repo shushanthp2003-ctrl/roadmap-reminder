@@ -1,38 +1,118 @@
-# Place at:  .github/workflows/reminder.yml
-# Free scheduler / heartbeat. The cron just wakes the script up; reminder.mjs decides
-# whether it's actually time to send, based on the time + days you set inside the app.
-# You never edit this cron to change your schedule — do that in the app.
-name: Roadmap reminder
+// Progress-aware daily reminder. Reads your live progress AND your schedule
+// (time + days, set in the app) from Supabase, then sends a personalized email
+// (Resend) + iPhone push (ntfy) — but only when the current time matches what
+// you chose. All free tiers. Runs on GitHub Actions on a timer (every 5 min by
+// default); the script, not the cron, decides whether it's time to send. Node 18+.
+//
+// Env (GitHub Actions secrets):
+//   SUPABASE_URL, SUPABASE_KEY, RESEND_API_KEY, MY_EMAIL, NTFY_TOPIC, APP_URL
 
-on:
-  schedule:
-    # Every 5 minutes (GitHub's minimum). The script gates on your chosen time/days,
-    # so you still get just one reminder a day — this only tightens the timing.
-    #
-    # IMPORTANT: */5 is only free on a PUBLIC repo (public = unlimited Actions minutes).
-    # On a PRIVATE repo the free tier is 2,000 min/month, and */5 (~8,640/mo) blows past it,
-    # which would pause your reminders till next month. If you must keep the repo private,
-    # use  "*/30 * * * *"  instead (~1,440/mo, comfortably free).
-    - cron: "*/5 * * * *"
-  workflow_dispatch: {}   # manual "Run workflow" button in the Actions tab, for testing
+const { SUPABASE_URL, SUPABASE_KEY, RESEND_API_KEY, MY_EMAIL, NTFY_TOPIC, APP_URL } = process.env;
 
-jobs:
-  remind:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - run: node reminder.mjs
-        env:
-          SUPABASE_URL:   ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY:   ${{ secrets.SUPABASE_KEY }}
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          MY_EMAIL:       ${{ secrets.MY_EMAIL }}
-          NTFY_TOPIC:     ${{ secrets.NTFY_TOPIC }}
-          APP_URL:        ${{ secrets.APP_URL }}
+// Sanitize: trim stray spaces/newlines and any trailing slash from the URL.
+const SB = (SUPABASE_URL || "").trim().replace(/\/+$/, "");
+const SB_KEY = (SUPABASE_KEY || "").trim();
+if (!/^https?:\/\//.test(SB)) {
+  console.error(
+    "SUPABASE_URL is not a valid URL. It must be your Supabase Project URL, e.g. " +
+    "https://abcdefgh.supabase.co (starts with https://, no spaces, no quotes). " +
+    "Fix the SUPABASE_URL secret and re-run."
+  );
+  process.exit(1);
+}
 
-# Even at */5, GitHub's scheduled runs are not punctual to the second — they can lag a few
-# minutes under load. This gets you "within a few minutes", not "on the dot". Truly on-time
-# needs the cron-job.org endpoint route (step 3c). This file is fine to leave as-is otherwise.
+const NUDGES = [
+  "Grey phases are the whole game for Anthropic. Chip at Phase 0 or 2 today.",
+  "Ship a proof, not a certificate. Which artifact is closest to done?",
+  "Build the GPT from scratch — that's the line between using and understanding LLMs.",
+  "No study time? Log a one-line check-in so the streak survives.",
+  "Future you at the Anthropic interview will thank present you for the math.",
+];
+
+const DEF_REMINDER = { enabled: true, time: "08:00", days: [0,1,2,3,4,5,6], tz: "Asia/Kolkata" };
+
+async function getRow() {
+  const r = await fetch(
+    `${SB}/rest/v1/progress?id=eq.me&select=pct,done,total,streak,next_task,last_active,state,last_sent`,
+    { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } }
+  );
+  const rows = await r.json();
+  return rows && rows[0] ? rows[0] : null;
+}
+
+// Current wall-clock in a given IANA timezone.
+function nowInTz(tz) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz, weekday: "short", year: "numeric", month: "2-digit",
+    day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(new Date());
+  const g = (t) => parts.find((x) => x.type === t)?.value;
+  const dow = { Sun:0, Mon:1, Tue:2, Wed:3, Thu:4, Fri:5, Sat:6 }[g("weekday")];
+  return { date: `${g("year")}-${g("month")}-${g("day")}`, hour: +g("hour"), minute: +g("minute"), dow };
+}
+
+function compose(p) {
+  const nudge = NUDGES[new Date().getDate() % NUDGES.length];
+  if (!p || p.total == null) return { title: "AI/ML roadmap", line: nudge };
+  const stale = p.last_active && (Date.now() - new Date(p.last_active)) / 864e5 >= 1;
+  const streakBit = p.streak > 0 && !stale ? `${p.streak}-day streak going. ` : "";
+  const staleBit = stale ? "Streak's about to reset — one tick saves it. " : "";
+  return {
+    title: `Roadmap: ${p.pct}% · ${p.done}/${p.total}`,
+    line: `${streakBit}${staleBit}Next up: ${p.next_task}.\n\n${nudge}`,
+  };
+}
+
+async function sendEmail(subject, body) {
+  if (!RESEND_API_KEY || !MY_EMAIL) return;
+  await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      from: "Roadmap <onboarding@resend.dev>", to: MY_EMAIL, subject,
+      html: `<p>${body.replace(/\n/g, "<br>")}</p><p><a href="${APP_URL || "#"}">Open your tracker &rarr;</a></p>`,
+    }),
+  });
+}
+
+async function sendPush(title, body) {
+  if (!NTFY_TOPIC) return;
+  await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
+    method: "POST",
+    headers: { Title: title, Click: APP_URL || "https://ntfy.sh", Tags: "books" },
+    body,
+  });
+}
+
+async function markSent(date) {
+  await fetch(`${SB}/rest/v1/progress?id=eq.me`, {
+    method: "PATCH",
+    headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`,
+      "Content-Type": "application/json", Prefer: "return=minimal" },
+    body: JSON.stringify({ last_sent: date }),
+  });
+}
+
+(async () => {
+  try {
+    const row = await getRow();
+    const r = { ...DEF_REMINDER, ...((row && row.state && row.state.reminder) || {}) };
+
+    if (!r.enabled) return console.log("skip: reminders disabled");
+
+    const now = nowInTz(r.tz || "Asia/Kolkata");
+    if (!r.days.includes(now.dow)) return console.log("skip: not a selected day");
+    if (row && row.last_sent === now.date) return console.log("skip: already sent today");
+
+    const [sh, sm] = String(r.time || "08:00").split(":").map(Number);
+    if (now.hour * 60 + now.minute < sh * 60 + sm) return console.log("skip: before scheduled time");
+
+    const { title, line } = compose(row);
+    await Promise.all([sendEmail(title, line), sendPush(title, line)]);
+    await markSent(now.date);
+    console.log("sent:", title);
+  } catch (e) {
+    console.error(e);
+    process.exit(1);
+  }
+})();
