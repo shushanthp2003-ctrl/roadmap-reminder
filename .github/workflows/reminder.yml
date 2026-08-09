@@ -1,0 +1,38 @@
+# Place at:  .github/workflows/reminder.yml
+# Free scheduler / heartbeat. The cron just wakes the script up; reminder.mjs decides
+# whether it's actually time to send, based on the time + days you set inside the app.
+# You never edit this cron to change your schedule — do that in the app.
+name: Roadmap reminder
+
+on:
+  schedule:
+    # Every 5 minutes (GitHub's minimum). The script gates on your chosen time/days,
+    # so you still get just one reminder a day — this only tightens the timing.
+    #
+    # IMPORTANT: */5 is only free on a PUBLIC repo (public = unlimited Actions minutes).
+    # On a PRIVATE repo the free tier is 2,000 min/month, and */5 (~8,640/mo) blows past it,
+    # which would pause your reminders till next month. If you must keep the repo private,
+    # use  "*/30 * * * *"  instead (~1,440/mo, comfortably free).
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # manual "Run workflow" button in the Actions tab, for testing
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node reminder.mjs
+        env:
+          SUPABASE_URL:   ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:   ${{ secrets.SUPABASE_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          MY_EMAIL:       ${{ secrets.MY_EMAIL }}
+          NTFY_TOPIC:     ${{ secrets.NTFY_TOPIC }}
+          APP_URL:        ${{ secrets.APP_URL }}
+
+# Even at */5, GitHub's scheduled runs are not punctual to the second — they can lag a few
+# minutes under load. This gets you "within a few minutes", not "on the dot". Truly on-time
+# needs the cron-job.org endpoint route (step 3c). This file is fine to leave as-is otherwise.
